@@ -16,6 +16,7 @@ So then start program like this: `withdll.exe /d:build-win/libwsl-fs-notify.dll 
 ## Limitations
 1. Reasonably modern Windows 10/11 x64
 2. Not thread-safe
-3. `ReadDirectoryChangesW` must be called by executable itself (not some other loaded DLL)
+3. `ReadDirectoryChangesW` must be called by executable itself (not by some other loaded DLL)
 4. Only asynchronous calls to `ReadDirectoryChangesW` with a completion routine are supported.
-5. `bWatchSubtree` is ignored
+5. `bWatchSubtree` is not fully implemented
+6. `dwNotifyFilter` is ignored

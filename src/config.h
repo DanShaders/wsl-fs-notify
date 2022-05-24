@@ -18,19 +18,38 @@ const uint32_t FILE_ACTION_RENAMED_NEW_NAME = 0x00000005;
 
 const uint32_t ERROR_WSL_START_FAILED = (1 << 29) | 1;
 const uint32_t ERROR_HANDSHAKE_FAILED = (1 << 29) | 2;
+const uint32_t ERROR_MODE_CHANGE = (1 << 29) | 3;
 
 #pragma pack(push, 1)
+struct HelloRequest {
+	char data[HELLO_LENGTH];
+
+	bool is_eq(const char *hello_str);  // utils.cc
+};
+
+/*
+ * Message types:
+ *  D - start watching directory (DirectoryWatchRequest)
+ *  S - stop watching directory (DirectoryUnwatchRequest)
+ *  U - fs event (Event)
+ */
+
 struct DirectoryWatchRequest {
-	char type;
+	char msg_type;
 	void *directory;
 	bool recursive;
-	uint64_t path_length;
-	char path[0];
+	// trailer: path
+};
+
+struct DirectoryUnwatchRequest {
+	char msg_type;
+	void *directory;
 };
 
 struct Event {
 	char msg_type;
 	void *directory;
 	uint32_t action;
+	// trailer: path
 };
 #pragma pack(pop)

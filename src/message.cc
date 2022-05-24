@@ -1,5 +1,7 @@
 #include "message.h"
 
+#include <unistd.h>
+
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
@@ -7,12 +9,22 @@
 #include <memory>
 
 #ifdef WIN32
+#	include <Windows.h>
+
 namespace std {
 void *aligned_alloc(size_t alignment, size_t size) {
 	return _aligned_malloc(size, alignment);
 }
 }  // namespace std
 #endif
+
+bool Message::write_to(fd_t handle) const {
+	return write_exactly(handle, {(char *) this, sizeof(Message) + length});
+}
+
+void Message::write_to(std::string &s) const {
+	s += std::string_view{(char *) this, sizeof(Message) + length};
+}
 
 PMessage Message::from(const char *body, uint64_t body_size, const char *trailing, uint64_t tlen) {
 	auto raw = (Message *) std::aligned_alloc(alignof(Message), sizeof(Message) + body_size + tlen);
@@ -76,4 +88,38 @@ std::optional<PMessage> MessageStream::pull_message() {
 		}
 	}
 	return get_message();
+}
+
+bool PullableMessageStream::pull(size_t length) {
+	const int BUFF = 4096;
+	static char buff[BUFF];
+
+	if (fd == INVALID_FD) {
+		return false;
+	}
+
+	while (length) {
+#ifdef WIN32
+		DWORD res;
+		if (!ReadFile(fd, buff, BUFF, &res, nullptr)) {
+			return false;
+		}
+#else
+		ssize_t res = read(fd, buff, BUFF);
+		if (res <= 0) {
+			return false;
+		}
+#endif
+		feed(buff, res);
+		if ((size_t) res >= length) {
+			break;
+		}
+		length -= res;
+	}
+	return true;
+}
+
+void PullableMessageStream::set_fd(fd_t fd_) {
+	assert(fd == INVALID_FD);
+	fd = fd_;
 }

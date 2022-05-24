@@ -48,12 +48,6 @@ void ensure_console() {
 	if (!has_console) {
 		if (AllocConsole()) {
 			ShowWindow(GetConsoleWindow(), SW_HIDE);
-
-			HANDLE handle_out = GetStdHandle(STD_OUTPUT_HANDLE);
-			int hCrt = _open_osfhandle((intptr_t) handle_out, _O_TEXT);
-			FILE *hf_out = _fdopen(hCrt, "w");
-			setvbuf(hf_out, NULL, _IONBF, 1);
-			*stdout = *hf_out;
 		}
 		has_console = true;
 	}
@@ -67,29 +61,17 @@ void ensure_console() {
 		}                      \
 	} while (0)
 
-bool write_exactly(HANDLE file, const char *buff, size_t len) {
-	DWORD written;
-
-	while (len) {
-		if (!WriteFile(file, buff, (DWORD) std::min<size_t>(len, MAXDWORD), &written, nullptr)) {
-			return false;
-		}
-		len -= written;
-		buff += written;
-	}
-	return true;
-}
-
 const int STDOUT_BUFF = 1024;
 
 struct ForeignNotifier {
 	HANDLE process, in, out;
 	char input[STDOUT_BUFF];
-	MessageStream in_stream;
+	PullableMessageStream in_stream;
 	OVERLAPPED out_ov{};
 };
 
 struct IOOperation {
+	HANDLE notify_in;
 	std::deque<PMessage> events;
 	void *buffer = nullptr;
 	DWORD buffer_length;
@@ -163,7 +145,7 @@ void stdout_cb(DWORD dwErrorCode, DWORD dwNumberOfBytesTransfered, LPOVERLAPPED 
 	ReadFileEx(notifier->out, &notifier->input, STDOUT_BUFF, &notifier->out_ov, stdout_cb);
 }
 
-bool WINAPI ReadDirectoryChangesW_detour(HANDLE hDirectory, LPVOID lpBuffer, DWORD nBufferLength,
+BOOL WINAPI ReadDirectoryChangesW_detour(HANDLE hDirectory, LPVOID lpBuffer, DWORD nBufferLength,
 										 BOOL bWatchSubtree, DWORD dwNotifyFilter,
 										 LPDWORD lpBytesReturned, LPOVERLAPPED lpOverlapped,
 										 LPOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
@@ -179,6 +161,12 @@ bool WINAPI ReadDirectoryChangesW_detour(HANDLE hDirectory, LPVOID lpBuffer, DWO
 	auto sep = path.find(L'\\', 13);
 	ERR_IF(sep == path.npos, ERROR_INVALID_FUNCTION);
 	auto distro = path.substr(13, sep - 13);
+	path = path.substr(sep);
+	for (wchar_t &c : path) {
+		if (c == L'\\') {
+			c = L'/';
+		}
+	}
 
 	auto it = notifiers.find(distro.c_str());
 	if (it == notifiers.end()) {
@@ -192,19 +180,20 @@ bool WINAPI ReadDirectoryChangesW_detour(HANDLE hDirectory, LPVOID lpBuffer, DWO
 			.lpSecurityDescriptor = nullptr,
 			.bInheritHandle = true,
 		};
-		if (!MyCreatePipeEx(&in, &notifier->in, &sa_attrs, 0, 0, 0) ||
-			!MyCreatePipeEx(&notifier->out, &out, &sa_attrs, 0, FILE_FLAG_OVERLAPPED, 0) ||
-			WslLaunch(distro.c_str(), WSL_COMMAND, false, in, out, GetStdHandle(STD_OUTPUT_HANDLE),
-					  &notifier->process) != S_OK) {
-			SetLastError(ERROR_WSL_START_FAILED);
-			return false;
-		}
+		ERR_IF(!MyCreatePipeEx(&in, &notifier->in, &sa_attrs, 0, 0, 0) ||
+				   !MyCreatePipeEx(&notifier->out, &out, &sa_attrs, 0, FILE_FLAG_OVERLAPPED, 0) ||
+				   WslLaunch(distro.c_str(), WSL_COMMAND, false, in, out,
+							 GetStdHandle(STD_OUTPUT_HANDLE), &notifier->process) != S_OK,
+			   ERROR_WSL_START_FAILED);
 
-		ERR_IF(!write_exactly(notifier->in, CLIENT_HELLO, HELLO_LENGTH), ERROR_HANDSHAKE_FAILED);
-		char buff[HELLO_LENGTH];
-		DWORD read;
-		ReadFile(notifier->out, buff, HELLO_LENGTH, &read, nullptr);
-		ERR_IF(read != HELLO_LENGTH || strncmp(buff, SERVER_HELLO, HELLO_LENGTH),
+		notifier->in_stream.set_fd(notifier->out);
+
+		HelloRequest client_hello;
+		memcpy(client_hello.data, CLIENT_HELLO, HELLO_LENGTH);
+		Message::from(client_hello)->write_to(notifier->in);
+
+		auto server_hello = notifier->in_stream.pull_message();
+		ERR_IF(!server_hello || !(*server_hello)->as<HelloRequest>()->is_eq(SERVER_HELLO),
 			   ERROR_HANDSHAKE_FAILED);
 
 		notifier->out_ov.hEvent = notifier.get();
@@ -223,32 +212,41 @@ bool WINAPI ReadDirectoryChangesW_detour(HANDLE hDirectory, LPVOID lpBuffer, DWO
 		return true;
 	}
 
-	io_ops[hDirectory] = {
-		{}, lpBuffer, nBufferLength, lpOverlapped, lpCompletionRoutine,
-	};
-
 	size_t path_length = wcstombs(nullptr, path.c_str(), 0);
-	auto req = (DirectoryWatchRequest *) malloc(sizeof(DirectoryWatchRequest) + path_length);
-	req->type = 'D';
-	req->directory = hDirectory;
-	req->recursive = bWatchSubtree;
-	req->path_length = path_length;
-	wcstombs((char *) (req + 1), path.c_str(), path_length);
+	std::string mbpath(path_length, 0);
+	wcstombs(&mbpath[0], path.c_str(), path_length + 1);
 
-	assert(write_exactly(it->second->in, (char *) req, sizeof(*req) + path_length));
-	free(req);
-	return true;
+	io_ops[hDirectory] = {
+		.notify_in = it->second->in,
+		.events = {},
+		.buffer = lpBuffer,
+		.buffer_length = nBufferLength,
+		.overlapped = lpOverlapped,
+		.overlapped_completion = lpCompletionRoutine,
+	};
+	DirectoryWatchRequest req = {
+		.msg_type = 'D',
+		.directory = hDirectory,
+		.recursive = (bool) bWatchSubtree,
+	};
+	return Message::from(req, mbpath.c_str(), mbpath.size())->write_to(it->second->in);
 }
 
-bool WINAPI CancelIo_detour(HANDLE hFile) {
+BOOL WINAPI CancelIo_detour(HANDLE hFile) {
 	auto it = io_ops.find(hFile);
 	if (it != io_ops.end()) {
 		if (it->second.buffer != nullptr) {
 			it->second.overlapped_completion(ERROR_OPERATION_ABORTED, 0, it->second.overlapped);
 		}
+
+		auto &op = it->second;
+		DirectoryUnwatchRequest req = {
+			.msg_type = 'S',
+			.directory = hFile,
+		};
+		Message::from(req)->write_to(op.notify_in);
 		io_ops.erase(it);
 	}
-
 	return CancelIo(hFile);
 }
 

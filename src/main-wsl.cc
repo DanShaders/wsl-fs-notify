@@ -1,3 +1,4 @@
+#include <dirent.h>
 #include <ev.h>
 #include <linux/limits.h>
 #include <sys/inotify.h>
@@ -8,6 +9,7 @@
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <set>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -15,63 +17,104 @@
 #include "config.h"
 #include "message.h"
 
-bool write_exactly(int fd, const char *buff, size_t len) {
-	while (len) {
-		ssize_t written = write(fd, buff, len);
-		if (written <= 0) {
-			return false;
-		}
-		len -= written;
-		buff += written;
-	}
-	return true;
-}
+const uint32_t INOTIFY_EVENTS = IN_CREATE | IN_DELETE | IN_MODIFY | IN_MOVED_FROM | IN_MOVED_TO;
 
-namespace {
 int notify_fd;
-char buf[sizeof(struct inotify_event) + PATH_MAX + 1]
-	__attribute__((aligned(__alignof__(struct inotify_event))));
 
 struct Directory {
+	int wd;
 	std::string path;
-	std::vector<void *> handles;
+	std::set<void *> handles;
 };
 
-std::map<int, Directory> listeners;
+PullableMessageStream in_stream;
+std::map<int, std::shared_ptr<Directory>> listeners;
+std::multimap<void *, std::shared_ptr<Directory>> by_handle;
+
+void install_watchers(std::string root, std::string path, void *handle) {
+	auto abspath = root + path;
+
+	int wd = inotify_add_watch(notify_fd, abspath.c_str(), INOTIFY_EVENTS);
+	if (wd == -1) {
+		return;
+	}
+
+	auto dir_it = listeners.find(wd);
+	if (dir_it == listeners.end()) {
+		dir_it = listeners.insert({wd, std::make_shared<Directory>()}).first;
+		dir_it->second->path = path;
+	}
+	auto dir = dir_it->second;
+	if (dir->handles.count(handle)) {
+		return;
+	}
+	dir->handles.insert(handle);
+	by_handle.insert({handle, dir});
+
+	DIR *d = opendir(abspath.c_str());
+	if (d) {
+		dirent *entry;
+		while ((entry = readdir(d))) {
+			std::string_view filename{entry->d_name};
+			if (entry->d_type == DT_DIR && filename != "." && filename != "..") {
+				install_watchers(root, path + entry->d_name + "/", handle);
+			}
+		}
+		closedir(d);
+	}
+}
+
+void do_directory_watch(DirectoryWatchRequest *req, std::string_view path) {
+	install_watchers(std::string(path) + "/", "", req->directory);
+}
+
+void do_directory_unwatch(DirectoryUnwatchRequest *req) {
+	auto [start, end] = by_handle.equal_range(req->directory);
+			
+	auto cnext = [](auto it) {
+		if (it == by_handle.end()) {
+			return it;
+		}
+		return next(it);
+	};
+	for (auto nxt = cnext(start); start != end; start = nxt, nxt = cnext(nxt)) {
+		auto dir = start->second;
+		dir->handles.erase(req->directory);
+		if (dir->handles.size() == 0) {
+			listeners.erase(dir->wd);
+			inotify_rm_watch(notify_fd, dir->wd);
+		}
+		by_handle.erase(start);
+	}
+}
 
 void stdin_cb(EV_P_ ev_io *w, int) {
-	char type;
-	if (read(STDIN_FILENO, &type, 1) == 0) {
+	const int BUFF = 4096;
+	static char buff[BUFF];
+
+	ssize_t buff_len = read(STDIN_FILENO, buff, BUFF);
+	if (buff_len <= 0) {
 		ev_io_stop(EV_A_ w);
 		ev_break(EV_A_ EVBREAK_ALL);
 	}
+	in_stream.feed(buff, buff_len);
 
-	if (type == 'D') {
-		DirectoryWatchRequest req;
-		assert(read(STDIN_FILENO, ((char *) &req) + 1, sizeof(req) - 1) == sizeof(req) - 1);
+	while (in_stream.has_message()) {
+		auto msg = *in_stream.get_message();
 
-		char path[req.path_length];
-		assert(read(STDIN_FILENO, path, req.path_length) == (ssize_t) req.path_length);
-
-		std::string real_path{path, req.path_length};
-		auto pos = real_path.find('\\', 13);
-		assert(pos != real_path.npos);
-		real_path = real_path.substr(pos);
-		for (char &c : real_path) {
-			if (c == '\\') {
-				c = '/';
-			}
+		if (msg->data[0] == 'D') {
+			do_directory_watch(msg->as<DirectoryWatchRequest>(),
+				msg->get_trailer<DirectoryWatchRequest>());
+		} else if (msg->data[0] == 'S') {
+			do_directory_unwatch(msg->as<DirectoryUnwatchRequest>());
 		}
-
-		int wd = inotify_add_watch(notify_fd, real_path.c_str(),
-								   IN_CREATE | IN_DELETE | IN_MODIFY | IN_MOVED_FROM | IN_MOVED_TO);
-
-		auto &dir = listeners[wd];
-		dir.handles.push_back(req.directory);
 	}
 }
 
-void notify_cb(EV_P_ ev_io *w, int) {
+void notify_cb(EV_P_ ev_io *, int) {
+	static char buf[sizeof(struct inotify_event) + PATH_MAX + 1]
+		__attribute__((aligned(__alignof__(struct inotify_event))));
+
 	const struct inotify_event *event;
 	ssize_t len = read(notify_fd, buf, sizeof(buf));
 
@@ -79,8 +122,8 @@ void notify_cb(EV_P_ ev_io *w, int) {
 		event = (const struct inotify_event *) ptr;
 
 		const auto &dir = listeners[event->wd];
-		for (auto handle : dir.handles) {
-			auto filename = dir.path + std::string{event->name, event->len};
+		for (auto handle : dir->handles) {
+			auto filename = dir->path + std::string{event->name, event->len};
 
 			Event msg;
 			msg.msg_type = 'U';
@@ -98,21 +141,21 @@ void notify_cb(EV_P_ ev_io *w, int) {
 				msg.action = FILE_ACTION_REMOVED;
 			}
 
-			// std::cerr << "sending " << filename << std::endl;
-
-			auto to_send = Message::from(msg, filename.c_str(), filename.size());
-			assert(write_exactly(STDOUT_FILENO, (const char *) to_send.get(),
-								 to_send->length + sizeof(Message)));
+			Message::from(msg, filename.c_str(), filename.size())->write_to(STDOUT_FILENO);
 		}
 	}
 }
-}  // namespace
 
 int main() {
-	char hello_buff[HELLO_LENGTH];
-	assert(read(STDIN_FILENO, hello_buff, HELLO_LENGTH) == HELLO_LENGTH);
-	assert(!strncmp(hello_buff, CLIENT_HELLO, HELLO_LENGTH));
-	assert(write_exactly(STDOUT_FILENO, SERVER_HELLO, HELLO_LENGTH));
+	in_stream.set_fd(STDIN_FILENO);
+
+	auto client_hello = in_stream.pull_message();
+	assert(client_hello);
+	assert((*client_hello)->as<HelloRequest>()->is_eq(CLIENT_HELLO));
+
+	HelloRequest req;
+	memcpy(req.data, SERVER_HELLO, HELLO_LENGTH);
+	Message::from(req)->write_to(STDOUT_FILENO);
 
 	struct ev_loop *loop = EV_DEFAULT;
 

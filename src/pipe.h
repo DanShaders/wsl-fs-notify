@@ -1,3 +1,5 @@
+#pragma once
+
 #include <Windows.h>
 
 BOOL WINAPI MyCreatePipeEx(OUT LPHANDLE lpReadPipe, OUT LPHANDLE lpWritePipe,

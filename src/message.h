@@ -1,10 +1,13 @@
 #pragma once
 
+#include <cassert>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <string_view>
+
+#include "utils.h"
 
 struct Message;
 
@@ -26,11 +29,15 @@ struct Message {
 
 	template <typename T>
 	T *as() {
+		assert(sizeof(T) <= length);
 		return (T *) data;
 	}
 
+	bool write_to(fd_t handle) const;
+	void write_to(std::string &s) const;
+
 	template <typename T>
-	std::string_view get_trailer() {
+	std::string_view get_trailer() const {
 		return {data + sizeof(T), data + length};
 	}
 
@@ -63,4 +70,15 @@ public:
 	bool has_message() const;
 	std::optional<PMessage> get_message();
 	std::optional<PMessage> pull_message();
+};
+
+class PullableMessageStream : public MessageStream {
+private:
+	fd_t fd = INVALID_FD;
+
+protected:
+	bool pull(size_t length) override;
+
+public:
+	void set_fd(fd_t fd_);
 };

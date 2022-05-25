@@ -1,0 +1,32 @@
+name: test-wsl
+
+on:
+  push:
+    branches: [ gh-actions ]
+  pull_request:
+    branches: [ gh-actions ]
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Start WSL2
+        run: |
+          Invoke-WebRequest https://wslstorestorage.blob.core.windows.net/wslblob/wsl_update_x64.msi -OutFile wsl_update_x64.msi
+          Start-Process msiexec.exe -ArgumentList "/i wsl_update_x64.msi /quiet" -Wait
+
+      - name: Run "wsl --install Debian"
+        run: wsl --install --distribution Debian
+
+      - name: Wait for installation
+        run: While ((wsl --list --verbose) -join ";" -replace "\0","" -Match "Installing") { Sleep 1 }
+
+      - name: Set WSL version to 2
+        run: wsl --set-version Debian 2
+
+      - name: Run "wsl --list --all"
+        run: wsl --list --verbose
+      
+      - name: Run "wsl whoami"
+        run: wsl --distribution Debian whoami

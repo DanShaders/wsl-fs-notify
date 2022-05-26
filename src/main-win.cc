@@ -1,11 +1,12 @@
 #include <Windows.h>
+#include <Detours.h>
 #include <fcntl.h>
 #include <psapi.h>
-#include <stdio.h>
 #include <wslapi.h>
 
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <iostream>
 #include <map>
@@ -16,7 +17,6 @@
 
 #include "config.h"
 #include "message.h"
-#include "pe.h"
 #include "pipe.h"
 
 std::wstring get_path_by_handle(HANDLE file) {
@@ -145,13 +145,16 @@ void stdout_cb(DWORD dwErrorCode, DWORD dwNumberOfBytesTransfered, LPOVERLAPPED 
 	ReadFileEx(notifier->out, &notifier->input, STDOUT_BUFF, &notifier->out_ov, stdout_cb);
 }
 
+auto ReadDirectoryChangesW_true = ReadDirectoryChangesW;
+auto CancelIo_true = CancelIo;
+
 BOOL WINAPI ReadDirectoryChangesW_detour(HANDLE hDirectory, LPVOID lpBuffer, DWORD nBufferLength,
 										 BOOL bWatchSubtree, DWORD dwNotifyFilter,
 										 LPDWORD lpBytesReturned, LPOVERLAPPED lpOverlapped,
 										 LPOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
 	std::wstring path = get_path_by_handle(hDirectory);
 	if (!path.starts_with(LR"(\\?\UNC\wsl$\)")) {
-		return ReadDirectoryChangesW(hDirectory, lpBuffer, nBufferLength, bWatchSubtree,
+		return ReadDirectoryChangesW_true(hDirectory, lpBuffer, nBufferLength, bWatchSubtree,
 									 dwNotifyFilter, lpBytesReturned, lpOverlapped,
 									 lpCompletionRoutine);
 	}
@@ -247,44 +250,37 @@ BOOL WINAPI CancelIo_detour(HANDLE hFile) {
 		Message::from(req)->write_to(op.notify_in);
 		io_ops.erase(it);
 	}
-	return CancelIo(hFile);
-}
-
-const std::pair<const char *, void *> ENTRIES[] = {
-	{"ReadDirectoryChangesW", (void *) ReadDirectoryChangesW_detour},
-	{"CancelIo", (void *) CancelIo_detour},
-};
-
-void import_callback(char *, char *function_name, uint64_t *import_offset) {
-	for (const auto &[function, address] : ENTRIES) {
-		if (!strcmp(function_name, function)) {
-			DWORD old_protect;
-			assert(VirtualProtect(import_offset, 8, PAGE_READWRITE, &old_protect));
-			*(import_offset) = (uint64_t) address;
-			assert(VirtualProtect(import_offset, 8, old_protect, &old_protect));
-		}
-	}
+	return CancelIo_true(hFile);
 }
 
 BOOL WINAPI DllMain([[maybe_unused]] HINSTANCE hinst, [[maybe_unused]] DWORD dwReason,
 					[[maybe_unused]] LPVOID reserved) {
+	if (DetourIsHelperProcess()) {
+		return TRUE;
+	}
+
 	if (dwReason == DLL_PROCESS_ATTACH) {
-		HMODULE image = GetModuleHandleW(nullptr);
-		assert(image);
+		DetourRestoreAfterWith();
+		DetourTransactionBegin();
+		DetourUpdateThread(GetCurrentThread());
 
-		MODULEINFO image_info;
-		assert(GetModuleInformation(GetCurrentProcess(), image, &image_info, sizeof(image_info)));
+		DetourAttach(&(void *&) ReadDirectoryChangesW_true, (void *) ReadDirectoryChangesW_detour);
+		DetourAttach(&(void *&) CancelIo_true, (void *) CancelIo_detour);
 
-		const size_t IMAGE_NAME_SIZE = 1024;
-		wchar_t image_name[IMAGE_NAME_SIZE];
-		assert(GetModuleFileNameW(image, image_name, IMAGE_NAME_SIZE));
-
-		for_each_import(image_name, (uint64_t) image_info.lpBaseOfDll, import_callback);
+		DetourTransactionCommit();
 	} else if (dwReason == DLL_PROCESS_DETACH) {
 		for (const auto &[name, notifier] : notifiers) {
-			CancelIo(notifier->out);
+			CancelIo_true(notifier->out);
 			TerminateProcess(notifier->process, 0);
 		}
+		
+		DetourTransactionBegin();
+		DetourUpdateThread(GetCurrentThread());
+
+		DetourDetach(&(void *&) ReadDirectoryChangesW_true, (void *) ReadDirectoryChangesW_detour);
+		DetourDetach(&(void *&) CancelIo_true, (void *) CancelIo_detour);
+
+		DetourTransactionCommit();
 	}
 	return true;
 }

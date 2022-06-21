@@ -70,7 +70,7 @@ void do_directory_watch(DirectoryWatchRequest *req, std::string_view path) {
 
 void do_directory_unwatch(DirectoryUnwatchRequest *req) {
 	auto [start, end] = by_handle.equal_range(req->directory);
-			
+
 	auto cnext = [](auto it) {
 		if (it == by_handle.end()) {
 			return it;
@@ -104,7 +104,7 @@ void stdin_cb(EV_P_ ev_io *w, int) {
 
 		if (msg->data[0] == 'D') {
 			do_directory_watch(msg->as<DirectoryWatchRequest>(),
-				msg->get_trailer<DirectoryWatchRequest>());
+							   msg->get_trailer<DirectoryWatchRequest>());
 		} else if (msg->data[0] == 'S') {
 			do_directory_unwatch(msg->as<DirectoryUnwatchRequest>());
 		}

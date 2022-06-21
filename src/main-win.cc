@@ -1,9 +1,12 @@
+//clang-format off
 #include <Windows.h>
 #include <Detours.h>
+//clang-format on
 #include <fcntl.h>
 #include <psapi.h>
 #include <wslapi.h>
 
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
@@ -16,6 +19,7 @@
 #include <vector>
 
 #include "config.h"
+#include "handle.h"
 #include "message.h"
 #include "pipe.h"
 
@@ -64,7 +68,11 @@ void ensure_console() {
 const int STDOUT_BUFF = 1024;
 
 struct ForeignNotifier {
-	HANDLE process, in, out;
+	std::atomic<HANDLE> in_read, in_write, out_read, out_write, process;
+	HANDLE process_waiter;
+
+	std::atomic_flag failed = ATOMIC_FLAG_INIT;
+
 	char input[STDOUT_BUFF];
 	PullableMessageStream in_stream;
 	OVERLAPPED out_ov{};
@@ -142,7 +150,24 @@ void stdout_cb(DWORD dwErrorCode, DWORD dwNumberOfBytesTransfered, LPOVERLAPPED 
 		op->second.flush();
 	}
 
-	ReadFileEx(notifier->out, &notifier->input, STDOUT_BUFF, &notifier->out_ov, stdout_cb);
+	ReadFileEx(notifier->out_read, &notifier->input, STDOUT_BUFF, &notifier->out_ov, stdout_cb);
+}
+
+void check_process(ForeignNotifier &notifier) {
+	DWORD exit_code;
+	if (GetExitCodeProcess(notifier.process, &exit_code)) {
+		if (exit_code != STILL_ACTIVE) {
+			notifier.failed.test_and_set();
+			close_handle(notifier.in_read);
+			close_handle(notifier.in_write);
+			close_handle(notifier.out_read);
+			close_handle(notifier.out_write);
+		}
+	}
+}
+
+void process_cb(void *raw_notifier, unsigned char timed_out) {
+	check_process(*(ForeignNotifier *) raw_notifier);
 }
 
 auto ReadDirectoryChangesW_true = ReadDirectoryChangesW;
@@ -155,8 +180,8 @@ BOOL WINAPI ReadDirectoryChangesW_detour(HANDLE hDirectory, LPVOID lpBuffer, DWO
 	std::wstring path = get_path_by_handle(hDirectory);
 	if (!path.starts_with(LR"(\\?\UNC\wsl$\)")) {
 		return ReadDirectoryChangesW_true(hDirectory, lpBuffer, nBufferLength, bWatchSubtree,
-									 dwNotifyFilter, lpBytesReturned, lpOverlapped,
-									 lpCompletionRoutine);
+										  dwNotifyFilter, lpBytesReturned, lpOverlapped,
+										  lpCompletionRoutine);
 	}
 
 	ERR_IF(lpCompletionRoutine == nullptr, ERROR_INVALID_FUNCTION);
@@ -173,35 +198,40 @@ BOOL WINAPI ReadDirectoryChangesW_detour(HANDLE hDirectory, LPVOID lpBuffer, DWO
 
 	auto it = notifiers.find(distro.c_str());
 	if (it == notifiers.end()) {
-		auto notifier = std::make_shared<ForeignNotifier>();
-
 		ensure_console();
 
-		HANDLE in, out;
 		SECURITY_ATTRIBUTES sa_attrs = {
 			.nLength = sizeof(SECURITY_ATTRIBUTES),
 			.lpSecurityDescriptor = nullptr,
 			.bInheritHandle = true,
 		};
-		ERR_IF(!MyCreatePipeEx(&in, &notifier->in, &sa_attrs, 0, 0, 0) ||
-				   !MyCreatePipeEx(&notifier->out, &out, &sa_attrs, 0, FILE_FLAG_OVERLAPPED, 0) ||
-				   WslLaunch(distro.c_str(), WSL_COMMAND, false, in, out,
-							 GetStdHandle(STD_OUTPUT_HANDLE), &notifier->process) != S_OK,
+
+		ManagedHandle stdin_read, stdin_write, stdout_read, stdout_write, process;
+		ERR_IF(!MyCreatePipeEx(&stdin_read.h, &stdin_write.h, &sa_attrs, 0, 0, 0) ||
+				   !MyCreatePipeEx(&stdout_read.h, &stdout_write.h, &sa_attrs, 0,
+								   FILE_FLAG_OVERLAPPED, 0) ||
+				   WslLaunch(distro.c_str(), WSL_COMMAND, false, stdin_read, stdout_write,
+							 GetStdHandle(STD_OUTPUT_HANDLE), &process.h) != S_OK,
 			   ERROR_WSL_START_FAILED);
 
-		notifier->in_stream.set_fd(notifier->out);
+		auto notifier = std::make_shared<ForeignNotifier>(stdin_read, stdin_write, stdout_read,
+														  stdout_write, process);
+		assert(RegisterWaitForSingleObject(&notifier->process_waiter, notifier->process, process_cb,
+										   notifier.get(), INFINITE, WT_EXECUTEONLYONCE));
+		check_process(*notifier);
+
+		notifier->in_stream.set_fd(notifier->out_read);
 
 		HelloRequest client_hello;
 		memcpy(client_hello.data, CLIENT_HELLO, HELLO_LENGTH);
-		Message::from(client_hello)->write_to(notifier->in);
+		ERR_IF(!Message::from(client_hello)->write_to(notifier->in_write), ERROR_HANDSHAKE_FAILED);
 
 		auto server_hello = notifier->in_stream.pull_message();
 		ERR_IF(!server_hello || !(*server_hello)->as<HelloRequest>()->is_eq(SERVER_HELLO),
 			   ERROR_HANDSHAKE_FAILED);
 
 		notifier->out_ov.hEvent = notifier.get();
-		assert(
-			ReadFileEx(notifier->out, &notifier->input, STDOUT_BUFF, &notifier->out_ov, stdout_cb));
+		ReadFileEx(notifier->out_read, &notifier->input, STDOUT_BUFF, &notifier->out_ov, stdout_cb);
 		it = notifiers.insert({distro.c_str(), notifier}).first;
 	}
 
@@ -220,7 +250,7 @@ BOOL WINAPI ReadDirectoryChangesW_detour(HANDLE hDirectory, LPVOID lpBuffer, DWO
 	wcstombs(&mbpath[0], path.c_str(), path_length + 1);
 
 	io_ops[hDirectory] = {
-		.notify_in = it->second->in,
+		.notify_in = it->second->in_write,
 		.events = {},
 		.buffer = lpBuffer,
 		.buffer_length = nBufferLength,
@@ -232,7 +262,7 @@ BOOL WINAPI ReadDirectoryChangesW_detour(HANDLE hDirectory, LPVOID lpBuffer, DWO
 		.directory = hDirectory,
 		.recursive = (bool) bWatchSubtree,
 	};
-	return Message::from(req, mbpath.c_str(), mbpath.size())->write_to(it->second->in);
+	return Message::from(req, mbpath.c_str(), mbpath.size())->write_to(it->second->in_write);
 }
 
 BOOL WINAPI CancelIo_detour(HANDLE hFile) {
@@ -270,10 +300,11 @@ BOOL WINAPI DllMain([[maybe_unused]] HINSTANCE hinst, [[maybe_unused]] DWORD dwR
 		DetourTransactionCommit();
 	} else if (dwReason == DLL_PROCESS_DETACH) {
 		for (const auto &[name, notifier] : notifiers) {
-			CancelIo_true(notifier->out);
+			CancelIo_true(notifier->out_read);
 			TerminateProcess(notifier->process, 0);
+			UnregisterWait(notifier->process_waiter);
 		}
-		
+
 		DetourTransactionBegin();
 		DetourUpdateThread(GetCurrentThread());
 

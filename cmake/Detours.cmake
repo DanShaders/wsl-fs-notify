@@ -53,5 +53,6 @@ if (BUILD_WITHDLL)
 		${DETOURS_ROOT}/samples/withdll/withdll.cpp
 	)
 	target_link_libraries(Detours_withdll Detours)
+	target_link_options(Detours_withdll PRIVATE -mwindows)
 	set_target_properties(Detours_withdll PROPERTIES OUTPUT_NAME "withdll")
 endif()

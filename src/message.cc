@@ -8,6 +8,10 @@
 #include <iostream>
 #include <memory>
 
+#ifdef WIN32
+#	include <Windows.h>
+#endif
+
 bool Message::write_to(fd_t handle) const {
 	return write_exactly(handle, {(char *) this, sizeof(Message) + length});
 }

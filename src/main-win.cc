@@ -1,7 +1,7 @@
-//clang-format off
-#include <Windows.h>
+#ifdef WIN32
+#	include <Windows.h>
+#endif
 #include <Detours.h>
-//clang-format on
 #include <fcntl.h>
 #include <psapi.h>
 #include <wslapi.h>

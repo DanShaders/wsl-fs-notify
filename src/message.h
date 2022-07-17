@@ -13,11 +13,7 @@ struct Message;
 
 struct MessageDeleter {
 	void operator()(Message *msg) {
-#ifdef WIN32
-		_aligned_free(msg);
-#else
 		free(msg);
-#endif
 	}
 };
 

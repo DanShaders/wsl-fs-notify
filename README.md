@@ -26,5 +26,4 @@ One of the ways to do so is by using `withdll.exe` from [Microsoft Detours libra
 ## Limitations
 1. Not thread-safe
 2. Only asynchronous calls to `ReadDirectoryChangesW` with a completion routine are supported.
-3. `bWatchSubtree` is not fully implemented
-4. `dwNotifyFilter` is ignored
+3. `dwNotifyFilter` is ignored

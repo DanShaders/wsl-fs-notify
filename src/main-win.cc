@@ -8,10 +8,12 @@
 
 #include <atomic>
 #include <cassert>
+#include <codecvt>
 #include <cstdint>
 #include <cstdio>
 #include <deque>
 #include <iostream>
+#include <locale>
 #include <map>
 #include <memory>
 #include <string>
@@ -78,6 +80,8 @@ struct ForeignNotifier {
 	OVERLAPPED out_ov{};
 };
 
+std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
+
 struct IOOperation {
 	HANDLE notify_in;
 	std::deque<PMessage> events;
@@ -94,11 +98,18 @@ struct IOOperation {
 		auto buff = (char *) buffer;
 		DWORD offset = 0;
 		DWORD *next_offset = nullptr;
+		bool has_failure = false;
+
 		while (events.size()) {
 			auto ev = events.front()->as<Event>();
+			if (ev->action == uint32_t(-1)) {
+				has_failure = true;
+				events.pop_front();
+				break;
+			}
 			auto path = events.front()->get_trailer<Event>();
-			size_t wlen = MultiByteToWideChar(CP_UTF8, 0, path.data(), (int) path.size(), 0, 0) - 1;
-			size_t clen = 2 * wlen + sizeof(FILE_NOTIFY_INFORMATION);
+			std::wstring filename = converter.from_bytes(path.data(), path.data() + path.size());
+			size_t clen = 2 * filename.size() + sizeof(FILE_NOTIFY_INFORMATION);
 
 			if (buffer_length - offset < clen) {
 				break;
@@ -107,9 +118,8 @@ struct IOOperation {
 			auto info = (FILE_NOTIFY_INFORMATION *) (buff + offset);
 			info->NextEntryOffset = (DWORD) clen;
 			info->Action = ev->action;
-			info->FileNameLength = (DWORD) wlen;
-			MultiByteToWideChar(CP_UTF8, 0, path.data(), (int) path.size(), info->FileName,
-								(int) wlen);
+			info->FileNameLength = (DWORD) filename.size();
+			memcpy(info->FileName, filename.data(), 2 * filename.size());
 
 			next_offset = &info->NextEntryOffset;
 			offset += (int) clen;
@@ -120,7 +130,8 @@ struct IOOperation {
 			*next_offset = 0;
 		}
 		buffer = nullptr;
-		overlapped_completion(ERROR_SUCCESS, offset, overlapped);
+		overlapped_completion(has_failure ? ERROR_INOTIFY_FAILED : ERROR_SUCCESS, offset,
+							  overlapped);
 	}
 };
 
@@ -166,7 +177,7 @@ void check_process(ForeignNotifier &notifier) {
 	}
 }
 
-void process_cb(void *raw_notifier, unsigned char timed_out) {
+void process_cb(void *raw_notifier, unsigned char) {
 	check_process(*(ForeignNotifier *) raw_notifier);
 }
 
@@ -245,10 +256,6 @@ BOOL WINAPI ReadDirectoryChangesW_detour(HANDLE hDirectory, LPVOID lpBuffer, DWO
 		return true;
 	}
 
-	size_t path_length = wcstombs(nullptr, path.c_str(), 0);
-	std::string mbpath(path_length, 0);
-	wcstombs(&mbpath[0], path.c_str(), path_length + 1);
-
 	io_ops[hDirectory] = {
 		.notify_in = it->second->in_write,
 		.events = {},
@@ -260,9 +267,11 @@ BOOL WINAPI ReadDirectoryChangesW_detour(HANDLE hDirectory, LPVOID lpBuffer, DWO
 	DirectoryWatchRequest req = {
 		.msg_type = 'D',
 		.directory = hDirectory,
+		.filter = dwNotifyFilter,
 		.recursive = (bool) bWatchSubtree,
 	};
-	return Message::from(req, mbpath.c_str(), mbpath.size())->write_to(it->second->in_write);
+	auto mbpath = converter.to_bytes(path);
+	return Message::from(req, mbpath.data(), mbpath.size())->write_to(it->second->in_write);
 }
 
 BOOL WINAPI CancelIo_detour(HANDLE hFile) {

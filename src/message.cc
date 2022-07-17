@@ -8,16 +8,6 @@
 #include <iostream>
 #include <memory>
 
-#ifdef WIN32
-#	include <Windows.h>
-
-namespace std {
-void *aligned_alloc(size_t alignment, size_t size) {
-	return _aligned_malloc(size, alignment);
-}
-}  // namespace std
-#endif
-
 bool Message::write_to(fd_t handle) const {
 	return write_exactly(handle, {(char *) this, sizeof(Message) + length});
 }
@@ -27,7 +17,7 @@ void Message::write_to(std::string &s) const {
 }
 
 PMessage Message::from(const char *body, uint64_t body_size, const char *trailing, uint64_t tlen) {
-	auto raw = (Message *) std::aligned_alloc(alignof(Message), sizeof(Message) + body_size + tlen);
+	auto raw = (Message *) std::malloc(sizeof(Message) + body_size + tlen);
 	assert(raw != nullptr);
 	PMessage msg{raw};
 	msg->length = body_size + tlen;
@@ -59,7 +49,7 @@ std::optional<PMessage> MessageStream::get_message() {
 	if (!has_message()) {
 		return {};
 	}
-	auto raw = (Message *) std::aligned_alloc(alignof(Message), sizeof(Message) + next_length);
+	auto raw = (Message *) std::malloc(sizeof(Message) + next_length);
 	assert(raw != nullptr);
 	PMessage msg{raw};
 	msg->length = next_length;

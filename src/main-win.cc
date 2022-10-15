@@ -53,7 +53,15 @@ void ensure_console() {
 
   if (!has_console) {
     if (AllocConsole()) {
+#if SHOW_DEBUG_CONSOLE
+      HANDLE handle_out = GetStdHandle(STD_OUTPUT_HANDLE);
+      int hCrt = _open_osfhandle((intptr_t) handle_out, _O_TEXT);
+      FILE *hf_out = _fdopen(hCrt, "w");
+      setvbuf(hf_out, NULL, _IONBF, 1);
+      *stdout = *hf_out;
+#else
       ShowWindow(GetConsoleWindow(), SW_HIDE);
+#endif
     }
     has_console = true;
   }
@@ -109,6 +117,11 @@ struct IOOperation {
       }
       auto path = events.front()->get_trailer<Event>();
       std::wstring filename = converter.from_bytes(path.data(), path.data() + path.size());
+      for (wchar_t &c : filename) {
+        if (c == L'/') {
+          c = L'\\';
+        }
+      }
       size_t clen = 2 * filename.size() + sizeof(FILE_NOTIFY_INFORMATION);
 
       if (buffer_length - offset < clen) {
@@ -118,7 +131,7 @@ struct IOOperation {
       auto info = (FILE_NOTIFY_INFORMATION *) (buff + offset);
       info->NextEntryOffset = (DWORD) clen;
       info->Action = ev->action;
-      info->FileNameLength = (DWORD) filename.size();
+      info->FileNameLength = (DWORD) (2 * filename.size());
       memcpy(info->FileName, filename.data(), 2 * filename.size());
 
       next_offset = &info->NextEntryOffset;

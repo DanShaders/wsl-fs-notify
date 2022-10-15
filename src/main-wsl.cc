@@ -196,6 +196,7 @@ void Watcher::process_events(int move_cookie) {
         std::ranges::find(from.dir->subdirs, from.filename, [](const auto &x) { return x->name; });
     if (curr != from.dir->subdirs.end()) {
       to.dir->subdirs.push_back(*curr);
+      (*curr)->parent = to.dir;
       from.dir->subdirs.erase(curr);
     }
   };

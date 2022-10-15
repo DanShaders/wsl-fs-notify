@@ -2,6 +2,8 @@
 
 #include <cstdint>
 
+#define SHOW_DEBUG_CONSOLE 0
+
 const wchar_t WSL_COMMAND[] = L"wsl-fs-notify";
 
 const char CLIENT_HELLO[] = "WFN\n\0";

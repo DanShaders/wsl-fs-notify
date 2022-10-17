@@ -122,7 +122,7 @@ struct IOOperation {
           c = L'\\';
         }
       }
-      size_t clen = 2 * filename.size() + sizeof(FILE_NOTIFY_INFORMATION);
+      size_t clen = 2 * filename.size() + 3 * sizeof(DWORD);
 
       if (buffer_length - offset < clen) {
         break;

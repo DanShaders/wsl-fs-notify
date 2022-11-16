@@ -311,7 +311,7 @@ void Watcher::process_queue() {
     bool trustworthy = true;
 
     for (auto entry : std::filesystem::directory_iterator{dir_abs_path}) {
-      if (!entry.is_directory()) {
+      if (!entry.is_directory() || entry.is_symlink()) {
         continue;
       }
       std::string curr_path = entry.path().string();
